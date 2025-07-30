@@ -16,6 +16,7 @@ services:
     scaling:
       minInstances: 1
       maxInstances: 3
+      targetCPUPercent: 70
     disk:
       name: hackrx-disk
       mountPath: /tmp
