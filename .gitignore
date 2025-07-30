@@ -27,3 +27,6 @@ Thumbs.db
 # Project specific
 *.pdf
 temp_*
+
+# Deployment
+Procfile

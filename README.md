@@ -41,6 +41,12 @@ The API will be available at `http://localhost:8000` with interactive docs at `/
 ```bash
 # Run comprehensive test suite
 python test.py
+
+# Test Render deployment readiness
+python test_render.py
+
+# Test sample request format
+python test_sample.py
 ```
 
 ## 📊 API Usage
@@ -158,13 +164,37 @@ docker run -p 8000:8000 \
   hackrx-api
 ```
 
-### Heroku
+### Render (Recommended Cloud Platform)
 ```bash
-# Deploy to Heroku
-heroku create your-app-name
-heroku config:set GEMINI_API_KEY=your_key
-heroku config:set API_KEY=your_api_key
-git push heroku main
+# Quick deployment using Blueprint (render.yaml)
+# 1. Fork this repository to your GitHub account
+# 2. Connect to Render Dashboard
+# 3. Create new Blueprint from your repository
+# 4. Set environment variables (GEMINI_API_KEY, API_KEY)
+# 5. Deploy automatically
+
+# Your API will be available at: https://your-service-name.onrender.com
+```
+
+**📖 For detailed Render deployment instructions, see [RENDER_DEPLOYMENT.md](./RENDER_DEPLOYMENT.md)**  
+**📋 Use the [DEPLOYMENT_CHECKLIST.md](./DEPLOYMENT_CHECKLIST.md) to ensure you're ready**
+
+### Testing Render Deployment
+```bash
+# Test if your app is ready for Render
+python test_render.py
+```
+
+#### Manual Render Deployment
+```bash
+# Alternative: Manual deployment via Render Dashboard
+# 1. Create new Web Service on Render
+# 2. Connect GitHub repository
+# 3. Configure build and start commands:
+#    Build Command: pip install -r requirements.txt
+#    Start Command: uvicorn app:app --host 0.0.0.0 --port $PORT
+# 4. Set environment variables in Render Dashboard
+# 5. Deploy
 ```
 
 ### Production Considerations
