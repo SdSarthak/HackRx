@@ -14,6 +14,12 @@ services:
         sync: false
       - key: ENVIRONMENT
         value: production
+      - key: GEMINI_REQUESTS_PER_MINUTE
+        value: 10
+      - key: QUESTION_PROCESSING_DELAY
+        value: 8
+      - key: MAX_RETRIES
+        value: 3
     scaling:
       minInstances: 1
       maxInstances: 3

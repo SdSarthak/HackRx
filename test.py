@@ -32,7 +32,7 @@ def test_health_check():
             health_data = response.json()
             print(f"✅ Health check passed")
             print(f"   Status: {health_data['status']}")
-            print(f"   Endpoint: {health_data['endpoint']}")
+            print(f"   Message: {health_data['message']}")
             return True
         else:
             print(f"❌ Health check failed: {response.status_code}")
@@ -68,18 +68,12 @@ def test_main_endpoint():
             print(f"   Processing time: {processing_time:.2f}s")
             print(f"   Questions answered: {len(result['answers'])}")
             
-            # Show enhanced answer details for first question
+            # Show simple answer details for first question
             if result['answers']:
                 first_answer = result['answers'][0]
-                print(f"\n📋 Sample Enhanced Answer:")
+                print(f"\n📋 Sample Answer:")
                 print(f"   Question: {test_request['questions'][0]}")
-                print(f"   Answer: {first_answer['answer'][:150]}...")
-                print(f"   Confidence: {first_answer['confidence_score']:.2%}")
-                print(f"   Source clauses found: {len(first_answer['source_clauses'])}")
-                print(f"   Reasoning: {first_answer['reasoning'][:100]}...")
-                
-                if first_answer['source_clauses']:
-                    print(f"   Top source clause: {first_answer['source_clauses'][0]['text'][:80]}...")
+                print(f"   Answer: {first_answer[:150]}...")
             
             return True
         else:
@@ -219,6 +213,12 @@ def run_comprehensive_test():
         print("✅ Most tests passed. API is largely functional.")
     else:
         print("⚠️  Some tests failed. Check the API implementation.")
+    
+    return passed == total
+
+if __name__ == "__main__":
+    success = run_comprehensive_test()
+    exit(0 if success else 1)
     
     return passed == total
 

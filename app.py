@@ -1,443 +1,266 @@
+from fastapi import FastAPI, Request, Header, HTTPException
+from pydantic import BaseModel
+from typing import List, Union
 import os
-import requests
-import tempfile
-import time
-import asyncio
-import hashlib
-from datetime import datetime
-from typing import List, Dict, Optional, Union, Any
 import re
+import fitz
+import tempfile
+import asyncio
+import time
+import warnings
 
-# FastAPI and middleware imports
-from fastapi import FastAPI, HTTPException, Depends, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+# Suppress NumPy/SciPy warnings
+warnings.filterwarnings("ignore", message="A NumPy version.*is required for this version of SciPy")
 
-# Pydantic models
-from pydantic import BaseModel, HttpUrl, Field
+# Try to import NLTK with fallback
+try:
+    import nltk
+    from nltk.tokenize import sent_tokenize
+    NLTK_AVAILABLE = True
+    try:
+        nltk.download("punkt", quiet=True)
+    except:
+        pass
+except ImportError:
+    NLTK_AVAILABLE = False
+    print("Warning: NLTK not available, using basic sentence splitting")
 
-# Document processing imports
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
-
-# Utilities
-import logging
 from dotenv import load_dotenv
+import requests
 
-# Load environment variables
-load_dotenv()
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Additional document loaders (with error handling)
+# Try to import LangChain with fallbacks for different versions
 try:
-    from docx import Document as DocxDocument
-except ImportError:
-    DocxDocument = None
-    logger.warning("python-docx not installed - DOCX support disabled")
+    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+    from langchain.chains import ConversationalRetrievalChain
+    from langchain.vectorstores import FAISS
+    from langchain.memory import ConversationBufferMemory
+    LANGCHAIN_AVAILABLE = True
+except ImportError as e:
+    print(f"LangChain import error: {e}")
+    try:
+        # Try alternative imports for newer versions
+        from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+        from langchain_community.chains import ConversationalRetrievalChain
+        from langchain_community.vectorstores import FAISS
+        from langchain.memory import ConversationBufferMemory
+        LANGCHAIN_AVAILABLE = True
+    except ImportError:
+        try:
+            # Try even newer version structure
+            from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+            from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
+            from langchain_community.vectorstores.faiss import FAISS
+            from langchain.memory.buffer import ConversationBufferMemory
+            LANGCHAIN_AVAILABLE = True
+        except ImportError:
+            LANGCHAIN_AVAILABLE = False
+            print("Warning: LangChain not properly configured")
 
-try:
-    import extract_msg
-except ImportError:
-    extract_msg = None
-    logger.warning("extract-msg not installed - MSG support disabled")
-
-import email
-from email.policy import default
-
-# Initialize FastAPI app
+# === FastAPI App ===
 app = FastAPI(
     title="HackRX Policy QA API",
-    description="Insurance policy Q&A system with explainable AI",
+    description="AI-powered Q&A system for insurance policy documents",
     version="1.0.0"
 )
 
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# === Load env variables ===
+load_dotenv()
+google_api_key = os.getenv("GEMINI_API_KEY")
+api_key = os.getenv("API_KEY", "d229e5eb06d6a264c4cebecd4fb0dc33e6a81c7bfa1f01945f751424fcac1e3a")
+environment = os.getenv("ENVIRONMENT", "development")
+question_delay = int(os.getenv("QUESTION_PROCESSING_DELAY", "8"))
+max_retries = int(os.getenv("MAX_RETRIES", "3"))
 
-# Security
-security = HTTPBearer()
+# === Config ===
+MODEL = "gemini-2.5-flash"
+DB_NAME = "vector_db"
 
-# Environment variables
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-API_KEY = os.getenv("API_KEY", "d229e5eb06d6a264c4cebecd4fb0dc33e6a81c7bfa1f01945f751424fcac1e3a")
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+# === Embeddings + LLM ===
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001", google_api_key=google_api_key)
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("GEMINI_API_KEY environment variable not found!")
 
-# Pydantic models
-class SourceClause(BaseModel):
-    """Model for source clause information."""
-    text: str = Field(..., description="Exact text of the clause")
-    page_number: Optional[int] = Field(None, description="Page number where clause was found")
-    confidence_score: float = Field(..., ge=0.0, le=1.0, description="Relevance confidence score")
-
-class EnhancedAnswer(BaseModel):
-    """Enhanced answer model with explainability."""
-    answer: str = Field(..., description="The main answer to the question")
-    confidence_score: float = Field(..., ge=0.0, le=1.0, description="Overall confidence in the answer")
-    source_clauses: List[SourceClause] = Field(default_factory=list, description="Relevant source clauses")
-    reasoning: str = Field(..., description="Explanation of how the answer was derived")
-
-class APIRequest(BaseModel):
-    """API request model."""
-    documents: Union[HttpUrl, List[HttpUrl]] = Field(..., description="Document URL(s) to process")
-    questions: List[str] = Field(..., min_items=1, max_items=50, description="Questions to answer")
-
-class APIResponse(BaseModel):
-    """API response model."""
-    answers: List[str] = Field(..., description="List of answer strings")
-
-# Global variables
-vectorstore = None
-llm = None
-embeddings_model = None
-
-# Authentication and utility functions
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Token verification."""
-    if credentials.credentials != API_KEY:
-        logger.warning("Invalid API key attempt")
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials.credentials
-
-def validate_file_size(file_size: int) -> bool:
-    """Validate file size against limits."""
-    return file_size <= MAX_FILE_SIZE
-
-def download_document(url: str) -> tuple[str, str]:
-    """Download document from URL and return local file path and type."""
-    try:
-        response = requests.get(str(url), timeout=30)
-        response.raise_for_status()
-        
-        # Validate file size
-        content_length = response.headers.get('content-length')
-        if content_length and not validate_file_size(int(content_length)):
-            raise HTTPException(status_code=413, detail="File too large")
-        
-        # Determine file type
-        content_type = response.headers.get('content-type', '').lower()
-        file_extension = '.pdf'  # default
-        
-        if 'pdf' in content_type or url.lower().endswith('.pdf'):
-            file_extension = '.pdf'
-        elif 'docx' in content_type or url.lower().endswith('.docx'):
-            file_extension = '.docx'
-        elif 'doc' in content_type or url.lower().endswith('.doc'):
-            file_extension = '.doc'
-        
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
-            tmp_file.write(response.content)
-            return tmp_file.name, file_extension
-            
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to download document: {str(e)}")
-
-def load_pdf_document(file_path: str) -> List[Document]:
-    """Load PDF document with enhanced metadata."""
-    try:
-        loader = PyPDFLoader(file_path)
-        documents = loader.load()
-        
-        # Enhance metadata
-        for i, doc in enumerate(documents):
-            doc.metadata.update({
-                'file_type': 'pdf',
-                'page_number': i + 1,
-                'source_file': os.path.basename(file_path)
-            })
-        
-        return documents
-    except Exception as e:
-        logger.error(f"Error loading PDF {file_path}: {e}")
-        return []
-
-def load_docx_document(file_path: str) -> List[Document]:
-    """Load DOCX document with paragraph-level chunking."""
-    if DocxDocument is None:
-        logger.error("python-docx not installed - cannot process DOCX files")
-        return []
+# === Text Preprocessing ===
+def download_pdf_from_url(url):
+    """Download PDF from URL and return the file path"""
+    response = requests.get(url)
+    response.raise_for_status()
     
-    try:
-        doc = DocxDocument(file_path)
-        documents = []
-        
-        for i, paragraph in enumerate(doc.paragraphs):
-            if paragraph.text.strip():
-                documents.append(Document(
-                    page_content=paragraph.text,
-                    metadata={
-                        'file_type': 'docx',
-                        'paragraph_number': i + 1,
-                        'source_file': os.path.basename(file_path)
-                    }
-                ))
-        
-        return documents
-    except Exception as e:
-        logger.error(f"Error loading DOCX {file_path}: {e}")
-        return []
+    # Create a temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.pdf')
+    temp_file.write(response.content)
+    temp_file.close()
+    
+    return temp_file.name
 
-def load_document_by_type(file_path: str, file_type: str) -> List[Document]:
-    """Load document based on file type."""
-    if file_type == '.pdf':
-        return load_pdf_document(file_path)
-    elif file_type in ['.docx', '.doc']:
-        return load_docx_document(file_path)
+def extract_clean_text_from_pdf(pdf_path):
+    document = fitz.open(pdf_path)
+    all_text = ""
+    for page in document:
+        all_text += page.get_text()
+    clean_text = re.sub(r"\s+", " ", all_text).strip()
+    return clean_text
+
+
+def basic_sentence_split(text):
+    """Basic sentence splitting fallback when NLTK is not available"""
+    # Split on common sentence endings
+    sentences = re.split(r'[.!?]+\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
+
+def sentence_chunker(text, max_words=500):
+    if NLTK_AVAILABLE:
+        sentences = sent_tokenize(text)
     else:
-        logger.warning(f"Unsupported file type: {file_type}")
-        return []
+        sentences = basic_sentence_split(text)
+    
+    chunks = []
+    current_chunk = []
+    current_len = 0
+    for sentence in sentences:
+        words = sentence.split()
+        if current_len + len(words) > max_words:
+            chunks.append(" ".join(current_chunk))
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(sentence)
+        current_len += len(words)
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+    return chunks
 
-async def initialize_models():
-    """Initialize LLM and embeddings models."""
-    global llm, embeddings_model
+
+def rag_pipeline(chunks):
+    if not LANGCHAIN_AVAILABLE:
+        raise HTTPException(status_code=500, detail="LangChain dependencies not available")
     
-    if not embeddings_model:
-        embeddings_model = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GEMINI_API_KEY
-        )
-    
-    if not llm:
+    if os.path.exists(DB_NAME):
+        try:
+            # Clean up existing vector store
+            import shutil
+            shutil.rmtree(DB_NAME)
+        except:
+            pass
+
+    try:
+        vectorstore = FAISS.from_texts(chunks, embedding=embeddings)
+        
         llm = ChatGoogleGenerativeAI(
-            model="gemini-1.5-flash",
-            temperature=0,
-            google_api_key=GEMINI_API_KEY
+            temperature=0.7, 
+            model=MODEL, 
+            google_api_key=google_api_key,
+            convert_system_message_to_human=True
         )
+        memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 15})
 
-def create_vectorstore_from_documents(documents: List[Document]) -> FAISS:
-    """Create FAISS vectorstore from documents."""
-    global embeddings_model
-    
-    if not embeddings_model:
-        embeddings_model = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            google_api_key=GEMINI_API_KEY
+        conversation_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm, retriever=retriever, memory=memory
         )
-    
-    return FAISS.from_documents(documents, embeddings_model)
-
-def extract_clause_references(context: str, answer: str) -> List[SourceClause]:
-    """Extract specific clause references from context and answer."""
-    clauses = []
-    
-    # Split context into potential clauses
-    sentences = re.split(r'[.!?]\s+', context)
-    
-    for i, sentence in enumerate(sentences):
-        if len(sentence.strip()) < 20:  # Skip very short sentences
-            continue
-            
-        # Calculate relevance score based on keyword overlap with answer
-        answer_words = set(answer.lower().split())
-        sentence_words = set(sentence.lower().split())
-        overlap = len(answer_words & sentence_words)
-        relevance_score = min(overlap / max(len(answer_words), 1), 1.0)
-        
-        if relevance_score > 0.2:  # Threshold for relevance
-            clauses.append(SourceClause(
-                text=sentence.strip(),
-                page_number=None,  # Would need to be extracted from metadata
-                confidence_score=relevance_score
-            ))
-    
-    # Sort by relevance and return top 3
-    clauses.sort(key=lambda x: x.confidence_score, reverse=True)
-    return clauses[:3]
-
-def enhance_answer_with_explanations(question: str, raw_answer: str, context: str, 
-                                   retrieved_docs: List[Document]) -> EnhancedAnswer:
-    """Enhance raw answer with explanations and source tracking."""
-    
-    # Extract source clauses
-    source_clauses = extract_clause_references(context, raw_answer)
-    
-    # Calculate confidence score based on context relevance
-    question_words = set(question.lower().split())
-    context_words = set(context.lower().split())
-    context_overlap = len(question_words & context_words) / max(len(question_words), 1)
-    confidence_score = min(context_overlap * 1.2, 1.0)  # Boost slightly
-    
-    # Generate reasoning explanation
-    reasoning = f"""Answer derived from analysis of {len(retrieved_docs)} document sections. 
-Key factors considered: document context relevance ({context_overlap:.2%}), 
-source clause alignment, and semantic similarity. Found {len(source_clauses)} relevant clauses."""
-    
-    return EnhancedAnswer(
-        answer=raw_answer,
-        confidence_score=confidence_score,
-        source_clauses=source_clauses,
-        reasoning=reasoning
-    )
-
-async def answer_question_enhanced(question: str) -> EnhancedAnswer:
-    """Enhanced question answering with explainability."""
-    global vectorstore, llm
-    
-    if not vectorstore or not llm:
-        raise HTTPException(status_code=500, detail="Document not processed yet")
-    
-    try:
-        # Retrieve relevant documents
-        retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
-        docs = retriever.get_relevant_documents(question)
-        
-        # Create enhanced context
-        context_parts = []
-        for i, doc in enumerate(docs):
-            page_info = f"[Page {doc.metadata.get('page_number', 'N/A')}]" if 'page_number' in doc.metadata else ""
-            context_parts.append(f"Source {i+1} {page_info}: {doc.page_content}")
-        
-        context = "\n\n".join(context_parts)
-        
-        # Create enhanced prompt
-        prompt = f"""You are an expert insurance policy analyst with deep knowledge of insurance terminology, legal clauses, and policy interpretation.
-
-INSTRUCTIONS:
-1. Answer the question based ONLY on the provided document context
-2. Be precise, specific, and use exact terms from the policy documents
-3. Include relevant clause numbers, section references, and specific amounts when available
-4. If information is not available in the context, clearly state this
-5. Use professional insurance terminology appropriately
-
-CONTEXT FROM POLICY DOCUMENTS:
-{context}
-
-QUESTION: {question}
-
-DETAILED ANSWER:"""
-        
-        # Generate answer
-        response = await asyncio.to_thread(llm.invoke, prompt)
-        raw_answer = response.content if hasattr(response, 'content') else str(response)
-        
-        # Enhance answer with explanations
-        enhanced_answer = enhance_answer_with_explanations(
-            question, raw_answer, context, docs
-        )
-        
-        logger.info(f"Generated enhanced answer for question: {question[:50]}...")
-        return enhanced_answer
-        
+        return conversation_chain
     except Exception as e:
-        logger.error(f"Error answering question: {e}")
-        raise HTTPException(status_code=500, detail=f"Error processing question: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create RAG pipeline: {str(e)}")
 
-# Main API endpoint
-@app.post("/hackrx/run", response_model=APIResponse)
-async def hackrx_run(request: APIRequest, api_key: str = Depends(verify_token)) -> APIResponse:
-    """Main endpoint for HackRX competition - handles document processing and Q&A."""
-    start_time = time.time()
-    
+# === API Models ===
+class HackRxRequest(BaseModel):
+    documents: Union[str, List[str]]
+    questions: List[str]
+
+# === Health Check Endpoint ===
+@app.get("/")
+async def health_check():
+    """Health check endpoint for Render deployment"""
+    return {
+        "status": "healthy",
+        "message": "HackRX Policy QA API is running",
+        "endpoint": "/hackrx/run",
+        "environment": environment
+    }
+
+@app.get("/health")
+async def health():
+    """Alternative health check endpoint"""
+    return {"status": "ok", "service": "hackrx-api"}
+
+# === Main HackRX Endpoint ===
+@app.post("/hackrx/run")
+async def run_hackrx(request: HackRxRequest, authorization: str = Header(None)):
+    """Main HackRX endpoint with simple response format"""
+    # Validate token
+    if authorization != f"Bearer {api_key}":
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid API key")
+
+    if not google_api_key:
+        raise HTTPException(status_code=500, detail="Google API key not configured")
+
+    if not LANGCHAIN_AVAILABLE:
+        raise HTTPException(status_code=503, detail="Service temporarily unavailable - LangChain dependencies missing")
+
     try:
-        logger.info(f"Processing request with {len(request.questions)} questions")
-        
-        # Handle multiple document URLs
+        # Handle both single document and multiple documents
         document_urls = request.documents if isinstance(request.documents, list) else [request.documents]
-        temp_files = []
-        all_documents = []
         
-        await initialize_models()
+        all_chunks = []
         
-        # Download and process documents
-        for url in document_urls:
-            file_path, file_type = download_document(url)
-            temp_files.append(file_path)
+        # Process each document
+        for doc_url in document_urls:
+            # Download PDF from URL
+            pdf_path = download_pdf_from_url(doc_url)
             
-            try:
-                # Load document based on type
-                documents = load_document_by_type(file_path, file_type)
-                if documents:
-                    all_documents.extend(documents)
-                    logger.info(f"Loaded {len(documents)} sections from {file_type} document")
-                else:
-                    logger.warning(f"No content found in document: {url}")
-                
-            except Exception as e:
-                logger.error(f"Error processing document {url}: {e}")
-                continue
+            # Process PDF
+            clean_text = extract_clean_text_from_pdf(pdf_path)
+            chunks = sentence_chunker(clean_text)
+            all_chunks.extend(chunks)
+            
+            # Clean up temporary file
+            os.unlink(pdf_path)
         
-        if not all_documents:
-            raise HTTPException(status_code=400, detail="No valid documents could be processed")
+        # Create RAG pipeline with all chunks
+        chatlm = rag_pipeline(all_chunks)
         
-        # Split documents into chunks
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1500,
-            chunk_overlap=300,
-            separators=["\n\n", "\n", ". ", ", ", " ", ""]
-        )
-        splits = text_splitter.split_documents(all_documents)
-        
-        # Create vector store
-        global vectorstore
-        vectorstore = create_vectorstore_from_documents(splits)
-        logger.info(f"Created vector store with {len(splits)} chunks")
-        
-        # Process all questions with simple string responses
+        questions = request.questions
         answers = []
-        
-        for i, question in enumerate(request.questions):
-            logger.info(f"Processing question {i+1}/{len(request.questions)}: {question[:50]}...")
+
+        for i, q in enumerate(questions):
+            retry_count = 0
+            while retry_count < max_retries:
+                try:
+                    response = chatlm.invoke(q)
+                    answers.append(response["answer"])
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    if retry_count >= max_retries:
+                        answers.append(f"Unable to process question due to: {str(e)}")
+                        break
+                    await asyncio.sleep(2)  # Wait before retry
             
-            try:
-                enhanced_answer = await answer_question_enhanced(question)
-                # Extract just the answer string for the response
-                answers.append(enhanced_answer.answer)
-                
-            except Exception as e:
-                logger.error(f"Error processing question {i+1}: {e}")
-                # Add error message as string
-                answers.append(f"Error processing question: {str(e)}")
+            # Add delay between questions to respect rate limits
+            if i < len(questions) - 1:  # Don't delay after the last question
+                await asyncio.sleep(question_delay)
         
-        processing_time = time.time() - start_time
-        
-        response = APIResponse(
-            answers=answers
-        )
-        
-        logger.info(f"Processing completed in {processing_time:.2f}s")
-        return response
-        
-    except HTTPException:
-        raise
+        return {"answers": answers}
+    
+    except requests.RequestException as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download document: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error in hackrx_run: {e}")
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-    finally:
-        # Clean up temporary files
+        # Clean up any remaining temporary files
+        import glob
+        temp_files = glob.glob("/tmp/tmp*.pdf")
         for temp_file in temp_files:
             try:
                 os.unlink(temp_file)
-            except Exception as e:
-                logger.warning(f"Failed to cleanup temp file {temp_file}: {e}")
+            except:
+                pass
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
-# Health check endpoint (minimal)
-@app.get("/")
-async def root():
-    """Root endpoint."""
-    return {
-        "message": "HackRX Policy QA API is running",
-        "endpoint": "/hackrx/run",
-        "status": "ready"
-    }
+# === Legacy Endpoint Support ===
+@app.post("/api/v1/hackrx/run")
+async def run_hackrx_legacy(request: HackRxRequest, authorization: str = Header(None)):
+    """Legacy endpoint for backward compatibility"""
+    return await run_hackrx(request, authorization)
 
+# === Run Application ===
 if __name__ == "__main__":
     import uvicorn
-    logger.info("Starting HackRX Policy QA API")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
