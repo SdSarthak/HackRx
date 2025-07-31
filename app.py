@@ -183,10 +183,19 @@ async def health():
 
 # === Main HackRX Endpoint ===
 @app.post("/hackrx/run")
-async def run_hackrx(request: HackRxRequest, authorization: str = Header(None)):
+async def run_hackrx(request: HackRxRequest, authorization: str = Header(None, alias="Authorization")):
     """Main HackRX endpoint with simple response format"""
     # Validate token
-    if authorization != f"Bearer {api_key}":
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing Authorization header")
+    
+    # Extract token from Bearer format
+    if authorization.startswith("Bearer "):
+        token = authorization[7:]  # Remove "Bearer " prefix
+    else:
+        token = authorization
+    
+    if token != api_key:
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid API key")
 
     if not google_api_key:
@@ -254,8 +263,8 @@ async def run_hackrx(request: HackRxRequest, authorization: str = Header(None)):
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # === Legacy Endpoint Support ===
-@app.post("/api/v1/hackrx/run")
-async def run_hackrx_legacy(request: HackRxRequest, authorization: str = Header(None)):
+@app.post("hackrx/run")
+async def run_hackrx_legacy(request: HackRxRequest, authorization: str = Header(None, alias="Authorization")):
     """Legacy endpoint for backward compatibility"""
     return await run_hackrx(request, authorization)
 
